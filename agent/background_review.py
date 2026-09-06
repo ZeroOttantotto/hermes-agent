@@ -1026,11 +1026,15 @@ def _run_review_fork(
 
 
 def _publish_review_summary(agent: Any, actions: List[str]) -> None:
-    summary = " · ".join(dict.fromkeys(actions))
-    agent._safe_print(f"  💾 Self-improvement review: {summary}")
+    if actions:
+        summary = " · ".join(dict.fromkeys(actions))
+    else:
+        summary = "completata — nessuna modifica necessaria"
+    message = f"💾 Self-improvement review: {summary}"
+    agent._safe_print(f"  {message}")
     if agent.background_review_callback:
         with suppress(Exception):
-            agent.background_review_callback(f"💾 Self-improvement review: {summary}")
+            agent.background_review_callback(message)
 
 
 def _run_review_in_thread(
@@ -1096,8 +1100,7 @@ def _run_review_in_thread(
             )
             actions = []
         _log_review_completion(st.review_usage, _classify_review_result(actions))
-        if actions:
-            _publish_review_summary(agent, actions)
+        _publish_review_summary(agent, actions)
     except Exception as e:
         logger.warning("Background memory/skill review failed: %s", e)
         if st.review_usage:

@@ -2750,6 +2750,14 @@ class MatrixAdapter(BasePlatformAdapter):
     def _markdown_to_html(self, text: str) -> str:
         """Markdown → org.matrix.custom.html via ``markdown`` when installed, else the regex fallback."""
         text = _pre_sanitize_matrix_markdown(text)
+        # Element X (mobile) renders HTML tables poorly; convert GFM pipe
+        # tables to bold-heading + bullet groups before conversion, matching
+        # the Telegram/Discord behavior (see gateway.platforms.helpers).
+        try:
+            from gateway.platforms.helpers import convert_table_to_bullets
+            text = convert_table_to_bullets(text)
+        except ImportError:
+            pass
         with suppress(ImportError):
             import markdown as _md
             md = _md.Markdown(extensions=["fenced_code", "tables", "nl2br", "sane_lists"])

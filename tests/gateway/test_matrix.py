@@ -701,7 +701,9 @@ class TestMatrixMarkdownToHtml:
         assert "Hello world" in result
 
 
-    def test_matrix_markdown_preserves_table_structure(self):
+    def test_matrix_markdown_converts_tables_to_bullets(self):
+        """GFM pipe tables are converted to bold-heading bullet groups: Element X
+        (mobile) renders HTML tables poorly (local policy, matches Telegram/Discord)."""
         table = "\n".join(
             [
                 "| Item | Quantity |",
@@ -713,11 +715,9 @@ class TestMatrixMarkdownToHtml:
 
         result = self.adapter._markdown_to_html(table)
 
-        assert "<table>" in result
-        assert "<thead>" in result
-        assert "<tbody>" in result
-        assert "<th>Item</th>" in result
-        assert "<td>Apples</td>" in result
+        assert "<table>" not in result
+        assert "Apples" in result
+        assert "Bread" in result
 
 
 # ---------------------------------------------------------------------------

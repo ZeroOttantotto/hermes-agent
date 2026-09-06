@@ -431,6 +431,29 @@ class TestStandaloneSend:
         assert headers.get("X-Tags") == _ntfy._ECHO_TAG
 
 
+    def test_emits_x_markdown_header_when_pconfig_markdown_true(self, monkeypatch):
+        """Standalone send emits X-Markdown: true header when
+        PlatformConfig.extra['markdown'] is True, matching adapter behavior."""
+        monkeypatch.setenv("NTFY_TOPIC", "hermes-in")
+        pconfig = MagicMock()
+        pconfig.extra = {"topic": "hermes-in", "markdown": True}
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"id": "id-md"}
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+
+        with patch.object(_ntfy, "httpx") as mock_httpx:
+            mock_httpx.AsyncClient.return_value = mock_client
+            result = _run(_standalone_send(pconfig, "hermes-in", "**bold**"))
+
+        assert result.get("success") is True
+        headers = mock_client.post.call_args[1]["headers"]
+        assert headers.get("X-Markdown") == "true"
+
 # ---------------------------------------------------------------------------
 # 11. register() — plugin-side metadata
 # ---------------------------------------------------------------------------
