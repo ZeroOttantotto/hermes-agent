@@ -618,7 +618,7 @@ def _override_to_catalog_shape(override: Dict[str, Any]) -> Tuple[Dict[str, Any]
     vision is out-of-band because it maps onto the ``modalities.input`` list rather than a scalar field."""
     patch: Dict[str, Any] = {}
     limit = {
-        catalog_key: value for catalog_key, override_key in (("context", "context_window"),)
+        catalog_key: value for catalog_key, override_key in (("context", "context_window"), ("output", "max_output_tokens"))
         if (value := _override_int(override, override_key)) is not None
     }
     if limit:
