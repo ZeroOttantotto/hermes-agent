@@ -113,13 +113,15 @@ class _ScriptedWebSocket(_FakeWebSocket):
     The auth handshake is the relay's (inherited from _FakeWebSocket); after
     it, each ``__anext__`` delegates to ``anext_behavior`` — a coroutine
     function returning the next raw frame or raising StopAsyncIteration for
-    a clean close.
+    a clean close. ``ping_behavior`` models the liveness round-trip.
     """
 
-    def __init__(self, anext_behavior):
+    def __init__(self, anext_behavior, ping_behavior=None):
         super().__init__()
         self._anext_behavior = anext_behavior
+        self._ping_behavior = ping_behavior
         self.exited = False
+        self.ping_count = 0
 
     async def __aenter__(self):
         return self
@@ -128,26 +130,232 @@ class _ScriptedWebSocket(_FakeWebSocket):
         self.exited = True
 
     def __aiter__(self):
+        # Match websockets 15.x: the frame iterator is distinct from the
+        # connection and does not expose ping().
+        return _ScriptedFrameIterator(self._anext_behavior)
+
+    async def ping(self):
+        self.ping_count += 1
+        if self._ping_behavior is None:
+            return await _resolved_pong()
+        return await self._ping_behavior()
+
+
+class _ScriptedFrameIterator:
+    def __init__(self, anext_behavior):
+        self._anext_behavior = anext_behavior
+
+    def __aiter__(self):
         return self
 
     async def __anext__(self):
         return await self._anext_behavior()
 
 
+async def _resolved_pong():
+    waiter = asyncio.get_running_loop().create_future()
+    waiter.set_result(0.0)
+    return waiter
+
+
+async def _unresolved_pong():
+    return asyncio.get_running_loop().create_future()
+
+
 @pytest.mark.asyncio
-async def test_websocket_loop_reconnects_when_read_goes_silent(monkeypatch, caplog):
+async def test_frame_wins_over_pending_liveness_probe(monkeypatch):
+    monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_INTERVAL", 0.01)
+    monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_TIMEOUT", 1)
+    frame_ready = asyncio.Event()
+    pong_started = asyncio.Event()
+    pong_waiter = None
+
+    async def anext_behavior():
+        await frame_ready.wait()
+        return "frame"
+
+    async def ping_behavior():
+        nonlocal pong_waiter
+        pong_waiter = asyncio.get_running_loop().create_future()
+        pong_started.set()
+        return pong_waiter
+
+    websocket = _ScriptedWebSocket(anext_behavior, ping_behavior)
+    frame_task = asyncio.create_task(
+        BuzzAdapter._read_frame_or_probe(_make_adapter(), websocket.__aiter__(), websocket)
+    )
+    await asyncio.wait_for(pong_started.wait(), 1)
+    frame_ready.set()
+
+    assert await asyncio.wait_for(frame_task, 1) == "frame"
+    assert pong_waiter.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_failed_probe_wins_simultaneous_frame_completion(monkeypatch):
+    monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_INTERVAL", 0.01)
+    monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_TIMEOUT", 1)
+    frame_ready = asyncio.Event()
+    probe_started = asyncio.Event()
+    probe_failed = asyncio.Event()
+
+    async def anext_behavior():
+        await frame_ready.wait()
+        return "frame"
+
+    async def ping_behavior():
+        probe_started.set()
+        await asyncio.sleep(0)
+        probe_failed.set()
+        raise ConnectionError("transport failed")
+
+    websocket = _ScriptedWebSocket(anext_behavior, ping_behavior)
+    frame_task = asyncio.create_task(
+        BuzzAdapter._read_frame_or_probe(_make_adapter(), websocket.__aiter__(), websocket)
+    )
+    await asyncio.wait_for(probe_started.wait(), 1)
+    frame_ready.set()
+    await asyncio.wait_for(probe_failed.wait(), 1)
+    await asyncio.sleep(0)
+
+    with pytest.raises(ConnectionError, match="transport failed"):
+        await asyncio.wait_for(frame_task, 1)
+
+
+@pytest.mark.asyncio
+async def test_liveness_race_cancellation_settles_pending_tasks(monkeypatch):
+    monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_INTERVAL", 0.01)
+    monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_TIMEOUT", 1)
+    pong_waiter = None
+    probe_started = asyncio.Event()
+
+    async def anext_behavior():
+        await asyncio.Event().wait()
+
+    async def ping_behavior():
+        nonlocal pong_waiter
+        pong_waiter = asyncio.get_running_loop().create_future()
+        probe_started.set()
+        return pong_waiter
+
+    websocket = _ScriptedWebSocket(anext_behavior, ping_behavior)
+    task = asyncio.create_task(
+        BuzzAdapter._read_frame_or_probe(_make_adapter(), websocket.__aiter__(), websocket)
+    )
+    await asyncio.wait_for(probe_started.wait(), 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 1)
+    assert pong_waiter.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_websocket_loop_keeps_a_quiet_healthy_connection(monkeypatch):
+    """A frameless-but-live subscription must not be reconnected.
+
+    Buzz channels go frameless when idle and websockets' asyncio client answers
+    keepalive pongs inside its own reader without ever yielding them to the
+    frame iterator, so a plain read bound cut a healthy socket every cycle.
+    """
+    adapter = _make_adapter()
+    monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_INTERVAL", 0.02)
+    monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_TIMEOUT", 0.02)
+
+    sockets = []
+
+    async def quiet_anext():
+        await asyncio.Event().wait()
+
+    def fake_connect(*args, **kwargs):
+        ws = _ScriptedWebSocket(quiet_anext, _resolved_pong)
+        sockets.append(ws)
+        return ws
+
+    import websockets as _ws_mod
+
+    monkeypatch.setattr(_ws_mod, "connect", fake_connect)
+    task = asyncio.create_task(adapter._websocket_loop())
+    await asyncio.sleep(0.2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 5.0)
+
+    assert len(sockets) == 1, "a quiet-but-live connection must not be reconnected"
+    assert sockets[0].ping_count >= 2, "the liveness probe never ran"
+    assert sockets[0].exited
+
+
+@pytest.mark.asyncio
+async def test_websocket_loop_clean_close_during_liveness_ping_backs_off(
+    monkeypatch
+):
+    """A 1000-OK close racing the liveness probe is a disconnect, not a crash.
+
+    websockets raises ConnectionClosedOK from ping() when the relay closes
+    cleanly while the probe is in flight. It must land on the same backoff +
+    "retrying" path as an exhausted frame iterator — main's contract for a
+    clean relay close — rather than being swallowed into a hot reconnect loop.
+    """
+    from websockets.exceptions import ConnectionClosedOK
+    from websockets.frames import Close
+
+    adapter = _make_adapter()
+    monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_INTERVAL", 0.01)
+    monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_TIMEOUT", 0.01)
+    states = []
+    monkeypatch.setattr(adapter, "_write_runtime_status_safe", lambda status, **kw: states.append(kw["platform_state"]))
+
+    async def quiet_anext():
+        await asyncio.Event().wait()
+
+    async def clean_ping_close():
+        raise ConnectionClosedOK(Close(1000, "normal closure"), None)
+
+    sockets = []
+    connects = []
+
+    def fake_connect(*args, **kwargs):
+        connects.append(1)
+        if len(connects) == 2:
+            raise asyncio.CancelledError()
+        ws = _ScriptedWebSocket(quiet_anext, clean_ping_close)
+        sockets.append(ws)
+        return ws
+
+    import websockets as _ws_mod
+
+    monkeypatch.setattr(_ws_mod, "connect", fake_connect)
+    task = asyncio.create_task(adapter._websocket_loop())
+    try:
+        await asyncio.sleep(0.3)
+    finally:
+        task.cancel()
+        try:
+            await asyncio.wait_for(task, 5.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+
+    assert len(sockets) == 1, f"a clean close must back off before reconnecting, got {len(connects)} connects in 0.3s"
+    assert sockets[0].exited
+    assert states == ["retrying"], f"a clean close racing the probe must publish retrying, got {states}"
+
+
+@pytest.mark.asyncio
+async def test_websocket_loop_reconnects_when_liveness_ping_goes_unanswered(monkeypatch, caplog):
     """A relay close the transport never surfaces must not park the loop.
 
-    Reproduces the #98097 shape: a socket stuck in CLOSE_WAIT yields no
-    frame and no error, so without a read-side bound the loop would wait
-    forever while the gateway keeps reporting "connected". The receive here
-    also ignores cancellation (#112049), which held the bound hostage as long
-    as it was an ``asyncio.wait_for``.
+    Reproduces the #98097 shape: a socket stuck in CLOSE_WAIT yields no frame
+    and no error, so without a read-side liveness probe the loop would wait
+    forever while the gateway keeps reporting "connected". Silence alone is
+    not the trigger — the unanswered ping is. The receive here also ignores
+    cancellation (#112049), which held the reconnect hostage as long as the
+    bound was an ``asyncio.wait_for``.
     """
     import logging
 
     adapter = _make_adapter()
-    monkeypatch.setattr(_buzz_mod, "_WS_READ_IDLE_TIMEOUT", 0.05)
+    monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_INTERVAL", 0.05)
+    monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_TIMEOUT", 0.05)
     caplog.set_level(logging.WARNING)
     states = []
     monkeypatch.setattr(adapter, "_write_runtime_status_safe", lambda status, **kw: states.append(kw["platform_state"]))
@@ -166,7 +374,7 @@ async def test_websocket_loop_reconnects_when_read_goes_silent(monkeypatch, capl
             raise
 
     def fake_connect(*args, **kwargs):
-        ws = _ScriptedWebSocket(dead_anext)
+        ws = _ScriptedWebSocket(dead_anext, _unresolved_pong)
         sockets.append(ws)
         return ws
 
@@ -207,7 +415,8 @@ async def test_websocket_loop_reconnects_when_discovery_send_sees_closed_socket(
     adapter.poll_interval = 0.02
     monkeypatch.setattr(_buzz_mod, "_MIN_POLL_INTERVAL", 0.02)
     monkeypatch.setattr(_buzz_mod, "_DM_DISCOVERY_EVERY", 1)
-    monkeypatch.setattr(_buzz_mod, "_WS_READ_IDLE_TIMEOUT", 30.0)  # far away: only the send side can end this
+    monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_INTERVAL", 30.0)  # far away: only the send side can end this
+    monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_TIMEOUT", 30.0)
 
     sockets = []
 
