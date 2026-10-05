@@ -10,6 +10,7 @@ provider. The real `_run_review_in_thread` function is exercised.
 from __future__ import annotations
 
 from agent import background_review as bg_review
+from agent import i18n
 from tools import terminal_tool as tt
 
 
@@ -66,6 +67,10 @@ class _NullContext:
 
 def _install(monkeypatch, *, summarize_result, run_raises=None):
     """Wire every dependency of `_run_review_in_thread` to stubs."""
+    # The summary text is now i18n-rendered (upstream), so pin English to keep the
+    # assertions deterministic regardless of the profile's display.language.
+    monkeypatch.setenv("HERMES_LANGUAGE", "en")
+    i18n.reset_language_cache()
     monkeypatch.setattr(
         bg_review, "thread_scoped_silence", lambda: _NullContext()
     )
@@ -150,9 +155,9 @@ def test_callback_with_no_actions(monkeypatch):
         agent, [{"role": "user", "content": "hi"}], "review"
     )
 
-    assert cb == ["💾 Self-improvement review: completata — nessuna modifica necessaria"]
+    assert cb == ["💾 Self-improvement review: completed — no changes needed"]
     assert printed == [
-        "  💾 Self-improvement review: completata — nessuna modifica necessaria"
+        "  💾 Self-improvement review: completed — no changes needed"
     ]
     assert failures == []
 
