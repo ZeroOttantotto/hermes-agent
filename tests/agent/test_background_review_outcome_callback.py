@@ -41,6 +41,8 @@ class _Agent:
         self.background_review_callback = None
         self._safe_print = lambda *_a, **_k: None
         self._emit_auxiliary_failure = lambda *_a, **_k: None
+        # Upstream's review path stamps the conversation root for the review agent.
+        self._conversation_root_id = lambda: "test-session"
 
 
 class _FakeReviewAgent:
