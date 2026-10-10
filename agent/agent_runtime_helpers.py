@@ -3349,6 +3349,26 @@ def trailing_continue_intent(text: str) -> bool:
 # stalled model whose turn would otherwise report "complete" with zero tool calls (#111761).
 # Tail-only and anchored on the last sentence, so reasoning that merely mentions a plan before
 # stating its answer ("...Let me check. The answer is 42.") still promotes.
+# Pseudo-XML tool-call tails (qwen38-flashnext-iq3 via llama.cpp, 2026-10-08): when a model
+# serializes its next tool call as literal XML in the reasoning channel (<function=terminal> /
+# <parameter=command> / </function>) instead of the native tool_calls field, that is a stalled
+# turn by definition — a legitimate answer never ends on an unclosed tool-call block. Matched
+# on the same 240-char tail window, unclosed-tag style only, so an answer that merely quotes
+# an already-closed </function> block keeps promoting.
+_PROMOTED_REASONING_TOOL_XML_TAIL_RE = re.compile(
+    r"<(?:function|tool_call|tool)[= >][^<]*(?:<(?:/)?parameter\b[^<]*)*$",
+    re.IGNORECASE,
+)
+# Closed variant (observed 2026-10-10, session 20261009_080252_e13997fc): the model serialized the
+# ENTIRE pseudo-XML tool call inside the reasoning channel — including its closing tags — and then
+# stopped with empty content and zero native tool_calls. The unclosed-only rule above missed it and
+# the reasoning was promoted as the final answer. In this code path content is already empty and
+# tool_calls already zero, so a tail that ENDS on a tool-call tag is a stall whether or not the
+# block was closed: a genuine answer carries content and never ends on a tag.
+_PROMOTED_REASONING_TOOL_XML_CLOSED_TAIL_RE = re.compile(
+    r"<[/:]?(?:function|tool_call|tool|invoke|parameter)[a-z_]*>\s*$",
+    re.IGNORECASE,
+)
 # Thai (unsegmented script, so no \b after the trigger, unlike the English group) shares the same
 # tail shape: a first-person future-action marker immediately followed by more Thai text, often
 # preceded by an em/en dash rather than sentence punctuation (#116495). Trigger glosses, in
@@ -3377,6 +3397,10 @@ def promoted_reasoning_announces_action(text: str) -> bool:
     t = (text or "").strip()
     if not t:
         return False
+    if _PROMOTED_REASONING_TOOL_XML_TAIL_RE.search(t[-240:]):
+        return True
+    if _PROMOTED_REASONING_TOOL_XML_CLOSED_TAIL_RE.search(t[-240:]):
+        return True
     return bool(_PROMOTED_REASONING_PLAN_TAIL_RE.search(t[-240:]))
 
 

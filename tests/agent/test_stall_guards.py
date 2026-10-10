@@ -485,3 +485,67 @@ def test_promoted_reasoning_detector_ignores_thai_stated_answers():
         "พรุ่งนี้จะฝนตกทั่วประเทศ",  # "tomorrow it will rain" — not a first-person action verb
     ):
         assert not promoted_reasoning_announces_action(text), text
+
+
+# ── promoted-reasoning pseudo-XML tool-call tail detector (qwen38-flashnext-iq3, 2026-10-08) ──
+
+
+def test_promoted_reasoning_detector_catches_pseudo_xml_tool_call_tails():
+    from agent.agent_runtime_helpers import promoted_reasoning_announces_action
+
+    # Verbatim tails from OmniRoute call_logs artifacts (2026-10-08): the IQ3 model serialized
+    # its next tool call as literal XML inside the reasoning channel, then stopped with zero
+    # tool_calls — the exact stall this detector exists for.
+    for tail in (
+        "I need to locate the llamacpp provider connection.\n\n<function=terminal>\n<parameter=command>\ndocker exec omniroute node -e \"SELECT * FROM provider_connections\"\n",
+        "I'm checking the OmniRoute configuration tables.\n\n<function=terminal>\n<parameter=command>\ngrep -n REASONING /home/luca/utilities/docker-compose.yml\n</parameter>\n",
+        "<function=web_search>\n<parameter=query>medium vs xhigh benchmark</parameter>\n",
+        "<tool_call> {\"name\": \"terminal\", \"arguments\": {\"command\": \"docker ps\"}}",
+        "<function=skill_view>\n<parameter=name>hermes-agent</parameter>",
+    ):
+        assert promoted_reasoning_announces_action(tail), tail
+
+
+def test_promoted_reasoning_detector_catches_closed_pseudo_xml_tails():
+    from agent.agent_runtime_helpers import promoted_reasoning_announces_action
+
+    # Verbatim shape from OmniRoute artifact 2026-10-10T06-13-55.510Z (session
+    # 20261009_080252_e13997fc): the model emitted the COMPLETE pseudo-XML tool call inside the
+    # reasoning channel — closing tags included — then stopped with empty content and zero native
+    # tool_calls. Tags are assembled from chr(60) so this file never contains a literal closing
+    # tag: emitting one verbatim here re-triggers the very stall under test in the authoring agent.
+    lt = chr(60)
+    closed_tail = (
+        "I need to read the skill file before I can decide on the merge.\n\n"
+        + lt + "function=execute_code>\n"
+        + lt + "parameter=code>\n"
+        + "from hermes_tools import read_file\n"
+        + 'r = read_file("/home/luca/.hermes/skills/upstream-fork-integration/SKILL.md")\n'
+        + lt + "/parameter>\n"
+        + lt + "/function>\n"
+        + lt + "/tool_call>"
+    )
+    assert promoted_reasoning_announces_action(closed_tail)
+    # Any tail ENDING on a tool-call tag (closed or self-closing) is a stall in this path.
+    for tail in (
+        "Let me verify the config.\n\n" + lt + "function=terminal>" + lt
+        + "parameter=command>ls" + lt + "/parameter>" + lt + "/function>",
+        lt + "invoke name=\"read_file\">" + lt + "parameter=path>/etc/hosts" + lt + "/invoke>",
+        "Checking now." + lt + "/parameter>",
+    ):
+        assert promoted_reasoning_announces_action(tail), tail
+
+
+def test_promoted_reasoning_detector_ignores_closed_xml_quoted_in_answers():
+    from agent.agent_runtime_helpers import promoted_reasoning_announces_action
+
+    # A legitimate answer may QUOTE a tool-call example — but only as a closed block followed by
+    # actual answer text. These must keep promoting as final answers.
+    for text in (
+        "To call the terminal tool you write <function=terminal><parameter=command>ls</parameter></function>. "
+        "The answer to your question is 42.",
+        "The previous turn used </function> markup, but the result was correct: the file is at /etc/hosts.",
+        "The reasoning block <function_call> was malformed, so I ran it manually. Done: 3 files updated.",
+        "The answer is 42.",
+    ):
+        assert not promoted_reasoning_announces_action(text), text
